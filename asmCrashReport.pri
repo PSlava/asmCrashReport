@@ -24,6 +24,12 @@ CONFIG (release, release|debug) {
 
         LIBS += "-L$$PWD/Win/WinDebug" -lDbghelp
     }
+    msvc {
+        DEFINES += ASM_CRASH_REPORT_MSVC
+        CONFIG += force_debug_info
+        CONFIG+=separate_debug_info
+        LIBS += -lDbgHelp
+    }
 
     mac {
         QMAKE_CFLAGS_RELEASE -= -O2

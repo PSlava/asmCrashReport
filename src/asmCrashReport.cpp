@@ -30,8 +30,10 @@
 
 #ifdef Q_OS_WIN
 #include <windows.h>
-#include <cxxabi.h>
 #include <imagehlp.h>
+# ifndef ASM_CRASH_REPORT_MSVC
+# include <cxxabi.h>
+# endif
 #else
 #include <err.h>
 #include <execinfo.h>
@@ -40,6 +42,7 @@
 
 #include "asmCrashReport.h"
 
+#define TRACE_MAX_FUNCTION_NAME_LENGTH 1024
 
 namespace asmCrashReport
 {
@@ -94,6 +97,7 @@ namespace asmCrashReport
    // Resolve symbol name & source location
    QString _addr2line( const QString &inProgramName, void const * const inAddr )
    {
+#ifndef ASM_CRASH_REPORT_MSVC
       const QString  cAddrStr = QStringLiteral( "0x%1" ).arg( quintptr( inAddr ), 16, 16, QChar( '0' ) );
 
 #ifdef Q_OS_MAC
@@ -114,6 +118,40 @@ namespace asmCrashReport
       const QString  cLocationStr = QString( sProcess->readAll() ).trimmed();
 
       return (cLocationStr == cAddrStr) ? QString() : cLocationStr;
+#else
+       HANDLE process = GetCurrentProcess();
+
+       IMAGEHLP_SYMBOL64 *symbol = (IMAGEHLP_SYMBOL64 *)malloc(sizeof(IMAGEHLP_SYMBOL64)+(TRACE_MAX_FUNCTION_NAME_LENGTH - 1) * sizeof(TCHAR));
+       symbol->MaxNameLength = TRACE_MAX_FUNCTION_NAME_LENGTH;
+       symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL64);
+       IMAGEHLP_LINE64 *line = (IMAGEHLP_LINE64 *)malloc(sizeof(IMAGEHLP_LINE64));
+       line->SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+       char *und_name = (char *)malloc(TRACE_MAX_FUNCTION_NAME_LENGTH);
+
+       QString locationStr = QString("????");
+       DWORD64 displacement64;
+       DWORD64 offset = DWORD64( quintptr(inAddr) );
+
+       if(SymGetSymFromAddr64(process, offset, &displacement64, symbol))
+       {
+           DWORD displacement;
+           locationStr = QString(symbol->Name);
+           if(*symbol->Name != '\0')
+           {
+               UnDecorateSymbolName(symbol->Name, und_name, TRACE_MAX_FUNCTION_NAME_LENGTH, UNDNAME_COMPLETE);
+               locationStr = QString(und_name);
+           }
+
+           if (SymGetLineFromAddr64(process, offset, &displacement, line))
+           {
+               locationStr += QString(" (%1 : %2)")
+                                 .arg(QString(line->FileName).split("\\").last())
+                                 .arg(line->LineNumber);
+           }
+       }
+
+       return locationStr;
+#endif
    }
 
 #ifdef Q_OS_WIN
@@ -123,6 +161,9 @@ namespace asmCrashReport
       HANDLE thread = GetCurrentThread();
 
       SymInitialize( process, 0, true );
+      DWORD symOptions = SymGetOptions();
+      symOptions |= SYMOPT_LOAD_LINES | SYMOPT_UNDNAME;
+      SymSetOptions(symOptions);
 
       STACKFRAME64 stackFrame;
       memset( &stackFrame, 0, sizeof( STACKFRAME64 ) );
@@ -138,9 +179,26 @@ namespace asmCrashReport
       stackFrame.AddrStack.Mode = AddrModeFlat;
       stackFrame.AddrFrame.Offset = context->Ebp;
       stackFrame.AddrFrame.Mode = AddrModeFlat;
+#elif _M_X64
+      image = IMAGE_FILE_MACHINE_AMD64;
+      stackFrame.AddrPC.Offset = context->Rip;
+      stackFrame.AddrPC.Mode = AddrModeFlat;
+      stackFrame.AddrFrame.Offset = context->Rsp;
+      stackFrame.AddrFrame.Mode = AddrModeFlat;
+      stackFrame.AddrStack.Offset = context->Rsp;
+      stackFrame.AddrStack.Mode = AddrModeFlat;
+#elif _M_IA64
+      image = IMAGE_FILE_MACHINE_IA64;
+      stackFrame.AddrPC.Offset = context->StIIP;
+      stackFrame.AddrPC.Mode = AddrModeFlat;
+      stackFrame.AddrstackFrame.Offset = context->IntSp;
+      stackFrame.AddrstackFrame.Mode = AddrModeFlat;
+      stackFrame.AddrBStore.Offset = context->RsBSP;
+      stackFrame.AddrBStore.Mode = AddrModeFlat;
+      stackFrame.AddrStack.Offset = context->IntSp;
+      stackFrame.AddrStack.Mode = AddrModeFlat;
 #else
-      // see http://theorangeduck.com/page/printing-stack-trace-mingw
-#error You need to define the stack frame layout for this architecture
+#error "This platform is not supported."
 #endif
 
       QStringList frameList;
@@ -152,8 +210,9 @@ namespace asmCrashReport
                  SymFunctionTableAccess64, SymGetModuleBase64, NULL )
               )
       {
-         QString  locationStr = _addr2line( sProgramName, (void*)stackFrame.AddrPC.Offset );
+         QString locationStr = _addr2line( sProgramName, (void*)stackFrame.AddrPC.Offset );
 
+#ifndef ASM_CRASH_REPORT_MSVC
          // match the mangled name and demangle if we can
          QRegularExpressionMatch match = sSymbolMatching.match( locationStr );
 
@@ -170,6 +229,7 @@ namespace asmCrashReport
                locationStr.replace( cSymbol, cFunctionName );
             }
          }
+#endif
 
          frameList += QStringLiteral( "[%1] 0x%2 %3" )
                       .arg( QString::number( frameNumber ) )
@@ -177,6 +237,8 @@ namespace asmCrashReport
                       .arg( locationStr );
 
          ++frameNumber;
+         if(frameNumber >= 10)
+             break;
       }
 
       SymCleanup( GetCurrentProcess() );
@@ -240,7 +302,15 @@ namespace asmCrashReport
 
       if ( inExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW )
       {
-         frameInfoList += _addr2line( sProgramName, (void*)inExceptionInfo->ContextRecord->Eip );
+          DWORD64 offset;
+#ifdef _M_IX86
+          offset = inExceptionInfo->ContextRecord->Eip;
+#elif _M_X64
+          offset = inExceptionInfo->ContextRecord->Rip;
+#elif _M_IA64
+          offset = inExceptionInfo->ContextRecord->StIIP;
+#endif
+         frameInfoList += _addr2line( sProgramName, (void*)offset );
       }
       else
       {
